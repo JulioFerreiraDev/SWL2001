@@ -1,5 +1,5 @@
-> **SF10 fallback supervisor (v4.8.0)**  
-> read some documentation: [README_SF10_FALLBACK.md](https://github.com/JulioFerreiraDev/SWL2001/blob/fa3afffdd08a38a8519973190d59865d6b38ec95/docs/README_SF10_FALLBACK.md)
+**SF10 fallback supervisor (v4.8.0)**  
+ - read some documentation: [README_SF10_FALLBACK.md](https://github.com/JulioFerreiraDev/SWL2001/blob/fa3afffdd08a38a8519973190d59865d6b38ec95/docs/README_SF10_FALLBACK.md)
 
 # LoRa Basic Modem
 
