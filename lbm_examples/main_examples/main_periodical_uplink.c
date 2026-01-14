@@ -1,4 +1,4 @@
-/*!
+/*! 
  * \file      main_periodical_uplink.c
  *
  * \brief     main program for periodical example
@@ -165,6 +165,13 @@ static const uint8_t user_app_key[16]     = USER_LORAWAN_APP_KEY;
 #define DELAY_FIRST_MSG_AFTER_JOIN 60
 #endif
 
+/* ===================== SF progressivo por falhas de ACK (TXDONE) ===================== */
+/* Observação: os valores de DR abaixo (escada DR3->DR2->DR1->DR0) refletem o caso típico AU915 (125 kHz):
+ * DR3=SF7, DR2=SF8, DR1=SF9, DR0=SF10. Ajuste se necessário para a sua região/plano. */
+#define ACK_FAILURES_THRESHOLD_TO_LOCK     5   // Falhas consecutivas para sair do ADR e travar em um SF mais robusto
+#define ACK_FAILURES_THRESHOLD_TO_STEP_UP  5   // Falhas consecutivas (já travado) para subir mais um SF
+#define LOCK_CONFIRMED_SUCCESSES_TO_EXIT   20  // Sucessos consecutivos (ACK) para voltar ao ADR (modo normal)
+
 /*
  * -----------------------------------------------------------------------------
  * --- PRIVATE TYPES -----------------------------------------------------------
@@ -192,6 +199,23 @@ static smtc_modem_relay_tx_config_t relay_config = { 0 };
 static uint8_t chip_eui[SMTC_MODEM_EUI_LENGTH] = { 0 };
 static uint8_t chip_pin[SMTC_MODEM_PIN_LENGTH] = { 0 };
 #endif
+
+/* ===================== Estado do SF progressivo (ACK) ===================== */
+static int  consecutive_ack_failures  = 0;     // conta quantas tentativas seguidas não tiveram confirmação (ACK)
+static int  consecutive_ack_successes = 0;     // conta quantos ACKs consecutivos ocorreram (para decidir retorno ao ADR)
+static bool sf_lock_active            = false; // indica se o modo "SF travado" está ativo
+
+static bool last_uplink_confirmed_requested = false;
+
+/* Escada de DR (do mais rápido para o mais robusto). Para o caso (ADR escolhe SF7 e falha),
+ * ao travar, o algoritmo sobe para SF8 (DR2) e reavalia. */
+static const uint8_t dr_ladder[] = { 3, 2, 1, 0 };
+#define DR_LADDER_LEN ( sizeof( dr_ladder ) / sizeof( dr_ladder[0] ) )
+static uint8_t dr_ladder_index = 0;
+
+/* Distribuição custom (preenchida em runtime) para forçar 100% em um DR específico */
+static uint8_t custom_adr_distribution_fixed[SMTC_MODEM_CUSTOM_ADR_DATA_LENGTH] = { 0 };
+
 /*
  * -----------------------------------------------------------------------------
  * --- PRIVATE FUNCTIONS DECLARATION -------------------------------------------
@@ -216,6 +240,12 @@ static void user_button_callback( void* context );
  * @brief Send the 32bits uplink counter on chosen port
  */
 static void send_uplink_counter_on_port( uint8_t port );
+
+/* SF progressivo por falhas de ACK (TXDONE) */
+static void apply_default_adr( const uint8_t stack_id );
+static void build_custom_distribution_force_dr( const uint8_t dr );
+static void apply_fixed_dr_lock( const uint8_t stack_id, const uint8_t dr );
+static void progressive_sf_lock_supervisor_on_txdone( const uint8_t stack_id, const smtc_modem_event_t* ev );
 
 /*
  * -----------------------------------------------------------------------------
@@ -289,6 +319,123 @@ void main_periodical_uplink( void )
  * -----------------------------------------------------------------------------
  * --- PRIVATE FUNCTIONS DEFINITION --------------------------------------------
  */
+
+static void apply_default_adr( const uint8_t stack_id )
+{
+    // O array custom é ignorado nesse perfil com ADR normal, mas precisa existir.
+    uint8_t custom_vazio[SMTC_MODEM_CUSTOM_ADR_DATA_LENGTH];
+    memset( custom_vazio, 0, sizeof( custom_vazio ) );
+
+    (void) smtc_modem_adr_set_profile( stack_id, SMTC_MODEM_ADR_PROFILE_NETWORK_CONTROLLED, custom_vazio );
+
+    // Retorna ao comportamento normal e reseta o supervisor
+    sf_lock_active            = false;
+    dr_ladder_index           = 0;
+    consecutive_ack_failures  = 0;
+    consecutive_ack_successes = 0;
+}
+
+static void build_custom_distribution_force_dr( const uint8_t dr )
+{
+    // Gera uma distribuição para travar o SF/DR desejado via perfil custom
+    memset( custom_adr_distribution_fixed, 0, sizeof( custom_adr_distribution_fixed ) );
+    if( dr < SMTC_MODEM_CUSTOM_ADR_DATA_LENGTH )
+    {
+        custom_adr_distribution_fixed[dr] = 0xFF;
+    }
+}
+
+static void apply_fixed_dr_lock( const uint8_t stack_id, const uint8_t dr )
+{
+    // Entra no modo "travar SF" via perfil custom (forçando um DR específico)
+    build_custom_distribution_force_dr( dr );
+    (void) smtc_modem_adr_set_profile( stack_id, SMTC_MODEM_ADR_PROFILE_CUSTOM, custom_adr_distribution_fixed );
+
+    sf_lock_active            = true;
+    consecutive_ack_failures  = 0;
+    consecutive_ack_successes = 0;
+}
+
+static void progressive_sf_lock_supervisor_on_txdone( const uint8_t stack_id, const smtc_modem_event_t* ev )
+{
+    if( ev == NULL )
+    {
+        return;
+    }
+
+    if( ev->event_type != SMTC_MODEM_EVENT_TXDONE )
+    {
+        return;
+    }
+
+    /* =========================
+     * 1) Contar ACK somente se o uplink foi solicitado como confirmado.
+     * ========================= */
+    if( last_uplink_confirmed_requested == false )
+    {
+        return;
+    }
+
+    const bool ack_ok = ( ev->event_data.txdone.status == SMTC_MODEM_EVENT_TXDONE_CONFIRMED );
+
+    if( ack_ok )
+    {
+        consecutive_ack_successes++;
+        consecutive_ack_failures = 0;
+    }
+    else
+    {
+        consecutive_ack_failures++;
+        consecutive_ack_successes = 0;
+    }
+
+    /* =========================
+     * 2) Se ainda está em ADR e começou a falhar, trava em um SF mais robusto (passo 1 da escada).
+     *    Exemplo: ADR em SF7 (DR3) falha -> trava em SF8 (DR2).
+     * ========================= */
+    if( sf_lock_active == false )
+    {
+        if( consecutive_ack_failures > ACK_FAILURES_THRESHOLD_TO_LOCK )
+        {
+            // Ao travar, já sobe um passo em relação ao "normal" (dr_ladder_index=0)
+            if( dr_ladder_index < ( DR_LADDER_LEN - 1 ) )
+            {
+                dr_ladder_index++;
+            }
+            apply_fixed_dr_lock( stack_id, dr_ladder[dr_ladder_index] );
+        }
+        return;
+    }
+
+    /* =========================
+     * 3) Se está travado e ainda falha, sobe mais um SF.
+     * ========================= */
+    if( consecutive_ack_failures > ACK_FAILURES_THRESHOLD_TO_STEP_UP )
+    {
+        if( dr_ladder_index < ( DR_LADDER_LEN - 1 ) )
+        {
+            dr_ladder_index++;
+            apply_fixed_dr_lock( stack_id, dr_ladder[dr_ladder_index] );
+        }
+        else
+        {
+            // Já está no mais robusto da escada; mantém travado e reseta o contador de falhas para evitar loop
+            consecutive_ack_failures = 0;
+        }
+        return;
+    }
+
+    /* =========================
+     * 4) Se estabilizou (ACKs consecutivos suficientes), volta ao ADR.
+     * ========================= */
+    if( consecutive_ack_successes >= LOCK_CONFIRMED_SUCCESSES_TO_EXIT )
+    {
+        apply_default_adr( stack_id );
+        return;
+    }
+
+    return;
+}
 
 static void modem_event_callback( void )
 {
@@ -380,6 +527,9 @@ static void modem_event_callback( void )
         case SMTC_MODEM_EVENT_TXDONE:
             SMTC_HAL_TRACE_INFO( "Event received: TXDONE\n" );
             SMTC_HAL_TRACE_INFO( "Transmission done \n" );
+
+            progressive_sf_lock_supervisor_on_txdone( stack_id, &current_event );
+
             break;
 
         case SMTC_MODEM_EVENT_DOWNDATA:
@@ -551,7 +701,13 @@ static void send_uplink_counter_on_port( uint8_t port )
     buff[1]         = ( uplink_counter >> 16 ) & 0xFF;
     buff[2]         = ( uplink_counter >> 8 ) & 0xFF;
     buff[3]         = ( uplink_counter & 0xFF );
-    ASSERT_SMTC_MODEM_RC( smtc_modem_request_uplink( STACK_ID, port, false, buff, 4 ) );
+
+    const bool confirmed = true;
+
+    // guarda se este uplink foi solicitado como confirmado
+    last_uplink_confirmed_requested = confirmed;
+
+    ASSERT_SMTC_MODEM_RC( smtc_modem_request_uplink( STACK_ID, port, confirmed, buff, 4 ) );
     // Increment uplink counter
     uplink_counter++;
 }
