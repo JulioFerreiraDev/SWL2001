@@ -165,12 +165,12 @@ static const uint8_t user_app_key[16]     = USER_LORAWAN_APP_KEY;
 #define DELAY_FIRST_MSG_AFTER_JOIN 60
 #endif
 
-/* ===================== SF progressivo por falhas de ACK (TXDONE) ===================== */
-/* Observação: os valores de DR abaixo (escada DR3->DR2->DR1->DR0) refletem o caso típico AU915 (125 kHz):
- * DR3=SF7, DR2=SF8, DR1=SF9, DR0=SF10. Ajuste se necessário para a sua região/plano. */
-#define ACK_FAILURES_THRESHOLD_TO_LOCK     5   // Falhas consecutivas para sair do ADR e travar em um SF mais robusto
-#define ACK_FAILURES_THRESHOLD_TO_STEP_UP  5   // Falhas consecutivas (já travado) para subir mais um SF
-#define LOCK_CONFIRMED_SUCCESSES_TO_EXIT   20  // Sucessos consecutivos (ACK) para voltar ao ADR (modo normal)
+/* ===================== Progressive SF due to ACK failures (TXDONE) ===================== */
+/* Note: The DR values ​​below (ladder DR3->DR2->DR1->DR0) reflect the typical AU915 case (125 kHz):
+* DR3=SF7, DR2=SF8, DR1=SF9, DR0=SF10. Adjust if necessary for your region/plan. */
+#define ACK_FAILURES_THRESHOLD_TO_LOCK     5   // Consecutive failures to exit ADR and lock into a more robust SF.
+#define ACK_FAILURES_THRESHOLD_TO_STEP_UP  5   // Consecutive failures (already locked) to climb another SF.
+#define LOCK_CONFIRMED_SUCCESSES_TO_EXIT   20  // Consecutive successes (ACK) to return to ADR (default mode)
 
 /*
  * -----------------------------------------------------------------------------
@@ -200,20 +200,18 @@ static uint8_t chip_eui[SMTC_MODEM_EUI_LENGTH] = { 0 };
 static uint8_t chip_pin[SMTC_MODEM_PIN_LENGTH] = { 0 };
 #endif
 
-/* ===================== Estado do SF progressivo (ACK) ===================== */
-static int  consecutive_ack_failures  = 0;     // conta quantas tentativas seguidas não tiveram confirmação (ACK)
-static int  consecutive_ack_successes = 0;     // conta quantos ACKs consecutivos ocorreram (para decidir retorno ao ADR)
-static bool sf_lock_active            = false; // indica se o modo "SF travado" está ativo
+/* ===================== Progressive SF State (ACK) ===================== */
+static int  consecutive_ack_failures  = 0;     // It counts how many consecutive attempts were not confirmed. (ACK)
+static int  consecutive_ack_successes = 0;     // counts how many consecutive ACKs have occurred (to decide whether to return to ADR)
+static bool sf_lock_active            = false; // Indicates whether "SF locked" mode is active.
 
 static bool last_uplink_confirmed_requested = false;
 
-/* Escada de DR (do mais rápido para o mais robusto). Para o caso (ADR escolhe SF7 e falha),
- * ao travar, o algoritmo sobe para SF8 (DR2) e reavalia. */
 static const uint8_t dr_ladder[] = { 3, 2, 1, 0 };
 #define DR_LADDER_LEN ( sizeof( dr_ladder ) / sizeof( dr_ladder[0] ) )
 static uint8_t dr_ladder_index = 0;
 
-/* Distribuição custom (preenchida em runtime) para forçar 100% em um DR específico */
+/* Custom distribution (populated at runtime) to force 100% on a specific DR. */
 static uint8_t custom_adr_distribution_fixed[SMTC_MODEM_CUSTOM_ADR_DATA_LENGTH] = { 0 };
 
 /*
@@ -241,7 +239,7 @@ static void user_button_callback( void* context );
  */
 static void send_uplink_counter_on_port( uint8_t port );
 
-/* SF progressivo por falhas de ACK (TXDONE) */
+/* Progressive SF due to ACK failures (TXDONE) */
 static void apply_default_adr( const uint8_t stack_id );
 static void build_custom_distribution_force_dr( const uint8_t dr );
 static void apply_fixed_dr_lock( const uint8_t stack_id, const uint8_t dr );
@@ -328,7 +326,7 @@ static void apply_default_adr( const uint8_t stack_id )
 
     (void) smtc_modem_adr_set_profile( stack_id, SMTC_MODEM_ADR_PROFILE_NETWORK_CONTROLLED, custom_vazio );
 
-    // Retorna ao comportamento normal e reseta o supervisor
+    // Returns to normal behavior and resets the supervisor.
     sf_lock_active            = false;
     dr_ladder_index           = 0;
     consecutive_ack_failures  = 0;
@@ -337,7 +335,7 @@ static void apply_default_adr( const uint8_t stack_id )
 
 static void build_custom_distribution_force_dr( const uint8_t dr )
 {
-    // Gera uma distribuição para travar o SF/DR desejado via perfil custom
+    // Generates a distribution to lock the desired SF/DR via custom profile.
     memset( custom_adr_distribution_fixed, 0, sizeof( custom_adr_distribution_fixed ) );
     if( dr < SMTC_MODEM_CUSTOM_ADR_DATA_LENGTH )
     {
@@ -347,7 +345,7 @@ static void build_custom_distribution_force_dr( const uint8_t dr )
 
 static void apply_fixed_dr_lock( const uint8_t stack_id, const uint8_t dr )
 {
-    // Entra no modo "travar SF" via perfil custom (forçando um DR específico)
+    // Enter "lock SF" mode via custom profile (forcing a specific DR).
     build_custom_distribution_force_dr( dr );
     (void) smtc_modem_adr_set_profile( stack_id, SMTC_MODEM_ADR_PROFILE_CUSTOM, custom_adr_distribution_fixed );
 
@@ -369,7 +367,7 @@ static void progressive_sf_lock_supervisor_on_txdone( const uint8_t stack_id, co
     }
 
     /* =========================
-     * 1) Contar ACK somente se o uplink foi solicitado como confirmado.
+     * 1) Count the ACK only if the uplink request was confirmed.
      * ========================= */
     if( last_uplink_confirmed_requested == false )
     {
@@ -390,8 +388,8 @@ static void progressive_sf_lock_supervisor_on_txdone( const uint8_t stack_id, co
     }
 
     /* =========================
-     * 2) Se ainda está em ADR e começou a falhar, trava em um SF mais robusto (passo 1 da escada).
-     *    Exemplo: ADR em SF7 (DR3) falha -> trava em SF8 (DR2).
+     * 2) If it is still in ADR and has started to fail, lock into a more robust SF (step 1 of the ladder).
+     * Example: ADR in SF7 (DR3) fails -> locks into SF8 (DR2).
      * ========================= */
     if( sf_lock_active == false )
     {
@@ -408,7 +406,7 @@ static void progressive_sf_lock_supervisor_on_txdone( const uint8_t stack_id, co
     }
 
     /* =========================
-     * 3) Se está travado e ainda falha, sobe mais um SF.
+     * 3) If it´s stuck and still failing, go up another SF.
      * ========================= */
     if( consecutive_ack_failures > ACK_FAILURES_THRESHOLD_TO_STEP_UP )
     {
@@ -419,14 +417,14 @@ static void progressive_sf_lock_supervisor_on_txdone( const uint8_t stack_id, co
         }
         else
         {
-            // Já está no mais robusto da escada; mantém travado e reseta o contador de falhas para evitar loop
+            // It´s already in the most robust part of the ladder; it keeps it locked and resets the fault counter to prevent loops.
             consecutive_ack_failures = 0;
         }
         return;
     }
 
     /* =========================
-     * 4) Se estabilizou (ACKs consecutivos suficientes), volta ao ADR.
+     * 4) If it stabilizes (enough consecutive ACKs), it returns to ADR.
      * ========================= */
     if( consecutive_ack_successes >= LOCK_CONFIRMED_SUCCESSES_TO_EXIT )
     {
@@ -704,7 +702,7 @@ static void send_uplink_counter_on_port( uint8_t port )
 
     const bool confirmed = true;
 
-    // guarda se este uplink foi solicitado como confirmado
+    // Please check if this uplink request has been confirmed.
     last_uplink_confirmed_requested = confirmed;
 
     ASSERT_SMTC_MODEM_RC( smtc_modem_request_uplink( STACK_ID, port, confirmed, buff, 4 ) );
