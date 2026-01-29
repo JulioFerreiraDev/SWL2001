@@ -1,5 +1,5 @@
 ## adaptative fallback supervisor (v4.8.0)  
- - read some documentation: [README_fallback supervisor.md](https://github.com/JulioFerreiraDev/SWL2001/blob/fa3afffdd08a38a8519973190d59865d6b38ec95/docs/README_SF10_FALLBACK.md)
+ - read some documentation: [README_fallback supervisor.md](https://github.com/JulioFerreiraDev/SWL2001/blob/feature/rate-lock-progressive-480/docs/README_Fallback_Supervisor.md)
 
 # LoRa Basic Modem
 
