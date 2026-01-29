@@ -9,7 +9,7 @@ This repository contains a change on top of SWL2001 v4.8.0 to implement a **rate
 
 ## Flowchart
 
-![Progressive fallback flowchart](figures/flowchart_fallback.png)
+![Progressive fallback flowchart](figure/flowchart_fallback.png)
 
 ## Key variables (as implemented)
 
